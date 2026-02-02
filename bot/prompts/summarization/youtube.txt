@@ -1,0 +1,28 @@
+Convert the following YouTube video transcript into a structured note with this exact layout and style:
+
+Title line (ALL CAPS words allowed, punchy, 2–5 words)
+Length: {duration}
+
+Then include these sections in order:
+
+Summary
+- 4–6 bullet points
+- Each bullet starts with a relevant emoji + short bolded heading + 1–2 sentence explanation
+- Focus on the core narrative, key scenes, and takeaways (no filler, no timestamps)
+
+Insights Based on Numbers
+- 1–3 bullets
+- Only include quantitative claims (dates, temps, counts, frequencies, measurements). If none exist, write "None mentioned."
+
+Example Exploratory Questions
+- Exactly 3 numbered questions
+- Each ends with: "(Enter E1 to ask)" / "(Enter E2 to ask)" / "(Enter E3 to ask)"
+- Questions should invite deeper reasoning about the content (not trivia)
+
+Rules:
+- Keep it concise and skimmable.
+- Preserve important proper nouns and locations.
+- Do not quote the transcript verbatim; paraphrase.
+
+Transcript:
+{content}

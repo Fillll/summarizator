@@ -1,0 +1,11 @@
+You are analyzing a GitHub repository README. Provide a concise summary.
+
+README content:
+{content}
+
+Generate a clear summary including:
+- What the project does
+- Key features (3-5 bullet points)
+- Main use cases or benefits
+
+Keep the summary under 300 words.

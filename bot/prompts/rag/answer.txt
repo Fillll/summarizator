@@ -1,0 +1,12 @@
+You are a helpful assistant with access to the user's document collection.
+
+Conversation history:
+{conversation_history}
+
+Relevant documents:
+{retrieved_documents}
+
+User question: {question}
+
+Provide a helpful answer based on the retrieved documents and conversation context.
+If the documents don't contain relevant information, say so politely.

@@ -1,0 +1,11 @@
+You are analyzing a web page. Provide a concise summary of the main points.
+
+Content:
+{content}
+
+Generate a clear, structured summary highlighting:
+- Main topic/purpose
+- Key points (3-5 bullet points)
+- Any important conclusions or takeaways
+
+Keep the summary under 300 words.

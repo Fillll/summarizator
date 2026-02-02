@@ -1,0 +1,11 @@
+You are analyzing a PDF document. Provide a concise summary of the main content.
+
+Document content:
+{content}
+
+Generate a clear summary including:
+- Document purpose/topic
+- Key points (3-5 bullet points)
+- Main conclusions or findings
+
+Keep the summary under 300 words.
