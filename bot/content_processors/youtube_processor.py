@@ -59,19 +59,22 @@ class YouTubeProcessor(ContentProcessor):
             original_lang = info.get('language', 'en') if info else 'en'
 
             # Step 2: Try youtube-transcript-api with retry on 429
-            subtitle_text = await loop.run_in_executor(
+            rate_limited = False
+            subtitle_text, rate_limited = await loop.run_in_executor(
                 None,
                 lambda: self._fetch_transcript(video_id, original_lang)
             )
 
-            # Step 3: Fall back to yt-dlp subtitle download
-            if not subtitle_text:
+            # Step 3: Fall back to yt-dlp subtitle download (skip if rate-limited — same endpoint)
+            if not subtitle_text and not rate_limited:
                 subtitle_text = await loop.run_in_executor(
                     None,
                     lambda: self._fetch_transcript_ytdlp(url, original_lang, info)
                 )
 
             if not subtitle_text:
+                if rate_limited:
+                    raise Exception("YouTube is rate-limiting caption requests. Please try again in a few minutes.")
                 raise Exception("No subtitles or captions available for this video")
 
             subtitle_text = re.sub(r'\s+', ' ', subtitle_text).strip()
@@ -93,7 +96,7 @@ class YouTubeProcessor(ContentProcessor):
         except Exception:
             return None
 
-    def _fetch_transcript(self, video_id: str, original_lang: str) -> Optional[str]:
+    def _fetch_transcript(self, video_id: str, original_lang: str) -> tuple:
         """Fetch transcript using youtube-transcript-api with retry.
 
         Language priority: English > original language > any available.
@@ -103,7 +106,7 @@ class YouTubeProcessor(ContentProcessor):
             original_lang: Detected video language from yt-dlp
 
         Returns:
-            Transcript text or None
+            Tuple of (transcript text or None, rate_limited bool)
         """
         for attempt in range(3):
             try:
@@ -113,7 +116,6 @@ class YouTubeProcessor(ContentProcessor):
                 priority_langs = ['en']
                 if original_lang and original_lang != 'en':
                     priority_langs.append(original_lang)
-                    # Also try original with suffix (e.g. 'ru-orig')
                     priority_langs.append(f'{original_lang}-orig')
 
                 # Try priority languages first, then fall back to any
@@ -128,7 +130,6 @@ class YouTubeProcessor(ContentProcessor):
                 # If no priority language found, use the first available
                 if not transcript:
                     try:
-                        # Get any available transcript
                         for t in transcripts:
                             transcript = t
                             break
@@ -136,18 +137,20 @@ class YouTubeProcessor(ContentProcessor):
                         pass
 
                 if not transcript:
-                    return None
+                    return None, False
 
                 segments = transcript.fetch()
-                return ' '.join([seg.text for seg in segments])
+                return ' '.join([seg.text for seg in segments]), False
 
             except Exception as e:
-                if '429' in str(e) and attempt < 2:
-                    time.sleep(3 + attempt * 4)  # 3s, 7s backoff
-                    continue
-                return None
+                if '429' in str(e):
+                    if attempt < 2:
+                        time.sleep(3 + attempt * 4)  # 3s, 7s backoff
+                        continue
+                    return None, True  # Exhausted retries, definitely rate-limited
+                return None, False
 
-        return None
+        return None, True
 
     def _fetch_transcript_ytdlp(self, url: str, original_lang: str, info: Optional[dict]) -> Optional[str]:
         """Fallback: fetch transcript via yt-dlp subtitle download.
