@@ -1,31 +1,22 @@
-"""YouTube video content processor using yt-dlp."""
+"""YouTube video content processor using youtube-transcript-api + yt-dlp."""
 import re
+import time
 import asyncio
 from typing import Optional
-import requests
 import yt_dlp
+from youtube_transcript_api import YouTubeTranscriptApi
 from bot.content_processors.base import ContentProcessor
 
 
 class YouTubeProcessor(ContentProcessor):
-    """Processor for YouTube videos (extracts closed captions using yt-dlp)."""
+    """Processor for YouTube videos (extracts captions)."""
 
     def __init__(self):
         """Initialize YouTube processor."""
         self._last_video_info = None
 
     def _extract_video_id(self, url: str) -> str:
-        """Extract YouTube video ID from URL.
-
-        Args:
-            url: YouTube URL
-
-        Returns:
-            Video ID
-
-        Raises:
-            ValueError: If video ID cannot be extracted
-        """
+        """Extract YouTube video ID from URL."""
         patterns = [
             r'(?:youtube\.com/watch\?v=|youtu\.be/)([^&\?/]+)',
             r'youtube\.com/embed/([^&\?/]+)',
@@ -40,7 +31,12 @@ class YouTubeProcessor(ContentProcessor):
         raise ValueError(f"Could not extract video ID from URL: {url}")
 
     async def extract_content(self, url: str) -> str:
-        """Extract closed captions from YouTube video using yt-dlp.
+        """Extract closed captions from YouTube video.
+
+        Strategy:
+        1. Use yt-dlp to get metadata (title, duration, detected language)
+        2. Use youtube-transcript-api to fetch transcript (English first, then original language, then any)
+        3. Fall back to yt-dlp subtitle download if transcript-api fails entirely
 
         Args:
             url: The YouTube video URL
@@ -52,217 +48,232 @@ class YouTubeProcessor(ContentProcessor):
             Exception: If content extraction fails
         """
         try:
-            # Configure yt-dlp options
-            ydl_opts = {
-                'writesubtitles': True,
-                'writeautomaticsub': True,
-                'subtitleslangs': ['en'],
-                'skip_download': True,
-                'quiet': True,
-                'no_warnings': True,
-            }
-
-            # Extract info in a thread pool to avoid blocking
+            video_id = self._extract_video_id(url)
             loop = asyncio.get_event_loop()
-            info = await loop.run_in_executor(
-                None,
-                lambda: self._extract_with_ytdlp(url, ydl_opts)
-            )
 
-            if not info:
-                raise Exception("Could not extract video information")
-
-            # Store video info for metadata extraction
+            # Step 1: Get metadata via yt-dlp (non-blocking)
+            info = await loop.run_in_executor(None, lambda: self._get_video_info(url))
             self._last_video_info = info
 
-            # Get subtitles
-            subtitles = info.get('subtitles', {})
-            automatic_captions = info.get('automatic_captions', {})
+            # Detect the video's original language
+            original_lang = info.get('language', 'en') if info else 'en'
 
-            # Try to get English subtitles (prefer manual over automatic)
-            subtitle_text = None
-            for lang in ['en', 'en-US', 'en-GB']:
-                if lang in subtitles:
-                    subtitle_text = await self._download_and_parse_subtitle(subtitles[lang])
-                    if subtitle_text:
-                        break
+            # Step 2: Try youtube-transcript-api with retry on 429
+            subtitle_text = await loop.run_in_executor(
+                None,
+                lambda: self._fetch_transcript(video_id, original_lang)
+            )
 
-            # Fall back to automatic captions if no manual subtitles
+            # Step 3: Fall back to yt-dlp subtitle download
             if not subtitle_text:
-                for lang in ['en', 'en-US', 'en-GB']:
-                    if lang in automatic_captions:
-                        subtitle_text = await self._download_and_parse_subtitle(automatic_captions[lang])
-                        if subtitle_text:
-                            break
+                subtitle_text = await loop.run_in_executor(
+                    None,
+                    lambda: self._fetch_transcript_ytdlp(url, original_lang, info)
+                )
 
             if not subtitle_text:
-                raise Exception("No English subtitles or captions available for this video")
+                raise Exception("No subtitles or captions available for this video")
 
-            # Clean up the text
             subtitle_text = re.sub(r'\s+', ' ', subtitle_text).strip()
-
             return f"# YouTube Video Transcript\n\n{subtitle_text}"
 
         except Exception as e:
             raise Exception(f"Failed to extract YouTube captions: {str(e)}")
 
-    def _extract_with_ytdlp(self, url: str, opts: dict) -> Optional[dict]:
-        """Extract video info using yt-dlp (blocking call).
-
-        Args:
-            url: YouTube URL
-            opts: yt-dlp options
-
-        Returns:
-            Video info dictionary or None
-        """
+    def _get_video_info(self, url: str) -> Optional[dict]:
+        """Get video metadata via yt-dlp."""
         try:
-            with yt_dlp.YoutubeDL(opts) as ydl:
+            ydl_opts = {
+                'skip_download': True,
+                'quiet': True,
+                'no_warnings': True,
+            }
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                 return ydl.extract_info(url, download=False)
         except Exception:
             return None
 
-    async def _download_and_parse_subtitle(self, subtitle_formats: list) -> Optional[str]:
-        """Download and parse subtitle from available formats.
+    def _fetch_transcript(self, video_id: str, original_lang: str) -> Optional[str]:
+        """Fetch transcript using youtube-transcript-api with retry.
+
+        Language priority: English > original language > any available.
 
         Args:
-            subtitle_formats: List of subtitle format dictionaries
+            video_id: YouTube video ID
+            original_lang: Detected video language from yt-dlp
 
         Returns:
-            Extracted subtitle text or None
+            Transcript text or None
         """
-        # Try different formats in order of preference
-        for fmt in subtitle_formats:
-            url = fmt.get('url')
-            if not url:
-                continue
-
+        for attempt in range(3):
             try:
-                # Download subtitle content
-                loop = asyncio.get_event_loop()
-                response = await loop.run_in_executor(
-                    None,
-                    lambda: requests.get(url, timeout=30)
-                )
+                transcripts = YouTubeTranscriptApi.list_transcripts(video_id)
 
-                if response.status_code != 200:
+                # Build language priority list
+                priority_langs = ['en']
+                if original_lang and original_lang != 'en':
+                    priority_langs.append(original_lang)
+                    # Also try original with suffix (e.g. 'ru-orig')
+                    priority_langs.append(f'{original_lang}-orig')
+
+                # Try priority languages first, then fall back to any
+                transcript = None
+                for lang in priority_langs:
+                    try:
+                        transcript = transcripts.find_transcript([lang])
+                        break
+                    except Exception:
+                        continue
+
+                # If no priority language found, use the first available
+                if not transcript:
+                    try:
+                        # Get any available transcript
+                        for t in transcripts:
+                            transcript = t
+                            break
+                    except Exception:
+                        pass
+
+                if not transcript:
+                    return None
+
+                segments = transcript.fetch()
+                return ' '.join([seg.text for seg in segments])
+
+            except Exception as e:
+                if '429' in str(e) and attempt < 2:
+                    time.sleep(3 + attempt * 4)  # 3s, 7s backoff
                     continue
+                return None
 
-                content = response.text
+        return None
 
-                # Parse based on format
-                ext = fmt.get('ext', '')
-                if ext in ['vtt', 'srv3']:
-                    return self._parse_vtt(content)
-                elif ext == 'json3':
-                    return self._parse_json3(content)
-                else:
-                    # Try to parse as VTT anyway
-                    parsed = self._parse_vtt(content)
-                    if parsed:
-                        return parsed
+    def _fetch_transcript_ytdlp(self, url: str, original_lang: str, info: Optional[dict]) -> Optional[str]:
+        """Fallback: fetch transcript via yt-dlp subtitle download.
 
-            except Exception:
-                continue
+        Args:
+            url: YouTube URL
+            original_lang: Detected video language
+            info: Previously extracted video info
+
+        Returns:
+            Transcript text or None
+        """
+        try:
+            # Build language list to try
+            langs_to_try = ['en', original_lang] if original_lang != 'en' else ['en']
+
+            # Get available languages from info
+            if info:
+                subtitles = info.get('subtitles', {})
+                auto = info.get('automatic_captions', {})
+                available = list(subtitles.keys()) + list(auto.keys())
+            else:
+                available = []
+
+            # Add any available languages not already in the list
+            for lang in available:
+                if lang not in langs_to_try:
+                    langs_to_try.append(lang)
+
+            # Try each language
+            for lang in langs_to_try:
+                result = self._download_subtitle_ytdlp(url, lang)
+                if result:
+                    return result
+
+            return None
+        except Exception:
+            return None
+
+    def _download_subtitle_ytdlp(self, url: str, lang: str) -> Optional[str]:
+        """Download a single subtitle file via yt-dlp with retry.
+
+        Args:
+            url: YouTube URL
+            lang: Language code
+
+        Returns:
+            Parsed subtitle text or None
+        """
+        import tempfile
+        import os
+
+        for attempt in range(3):
+            try:
+                with tempfile.TemporaryDirectory() as tmpdir:
+                    ydl_opts = {
+                        'writesubtitles': True,
+                        'writeautomaticsub': True,
+                        'subtitleslangs': [lang],
+                        'subtitlesformat': 'vtt',
+                        'skip_download': True,
+                        'outtmpl': os.path.join(tmpdir, '%(id)s'),
+                        'quiet': True,
+                        'no_warnings': True,
+                    }
+
+                    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                        ydl.download([url])
+
+                    # Find and read the subtitle file
+                    for filename in os.listdir(tmpdir):
+                        if filename.endswith('.vtt'):
+                            with open(os.path.join(tmpdir, filename), 'r', encoding='utf-8') as f:
+                                return self._parse_vtt(f.read())
+
+                    return None  # No file created
+
+            except Exception as e:
+                if '429' in str(e) and attempt < 2:
+                    time.sleep(3 + attempt * 4)
+                    continue
+                return None
 
         return None
 
     def _parse_vtt(self, content: str) -> Optional[str]:
-        """Parse VTT (WebVTT) subtitle format.
-
-        Args:
-            content: VTT file content
-
-        Returns:
-            Extracted text or None
-        """
+        """Parse VTT (WebVTT) subtitle format."""
         lines = []
         for line in content.split('\n'):
             line = line.strip()
-            # Skip VTT headers, timestamps, cue identifiers, and empty lines
             if (line and
                 not line.startswith('WEBVTT') and
-                not '-->' in line and
+                '-->' not in line and
                 not line.startswith('NOTE') and
                 not line.startswith('STYLE') and
                 not line.startswith('::cue') and
                 not line.isdigit()):
-                # Remove VTT formatting tags
                 line = re.sub(r'<[^>]+>', '', line)
                 if line:
                     lines.append(line)
 
         return ' '.join(lines) if lines else None
 
-    def _parse_json3(self, content: str) -> Optional[str]:
-        """Parse JSON3 subtitle format (YouTube's format).
-
-        Args:
-            content: JSON3 file content
-
-        Returns:
-            Extracted text or None
-        """
-        try:
-            import json
-            data = json.loads(content)
-            events = data.get('events', [])
-
-            lines = []
-            for event in events:
-                segs = event.get('segs', [])
-                for seg in segs:
-                    text = seg.get('utf8', '').strip()
-                    if text:
-                        lines.append(text)
-
-            return ' '.join(lines) if lines else None
-        except:
-            return None
-
     async def get_document_name(self, url: str, content: str) -> str:
-        """Generate short document name from video title.
+        """Generate short document name from video title."""
+        if self._last_video_info:
+            title = self._last_video_info.get('title', '')
+            if title:
+                return title[:57] + "..." if len(title) > 60 else title
 
-        Args:
-            url: The source URL
-            content: The extracted content
-
-        Returns:
-            Short, readable document name
-        """
+        # Fallback: extract via yt-dlp
         try:
-            ydl_opts = {
-                'quiet': True,
-                'no_warnings': True,
-                'skip_download': True,
-            }
-
             loop = asyncio.get_event_loop()
-            info = await loop.run_in_executor(
-                None,
-                lambda: self._extract_with_ytdlp(url, ydl_opts)
-            )
-
+            info = await loop.run_in_executor(None, lambda: self._get_video_info(url))
             if info:
                 title = info.get('title', '')
                 if title:
-                    # Truncate if too long
-                    if len(title) > 60:
-                        title = title[:57] + "..."
-                    return title
-        except:
+                    return title[:57] + "..." if len(title) > 60 else title
+        except Exception:
             pass
 
-        # Fallback
         video_id = self._extract_video_id(url)
         return f"YouTube Video {video_id}"
 
     def get_video_duration(self) -> str:
-        """Get video duration in MM:SS format.
-
-        Returns:
-            Duration string (e.g., "12:34") or "Unknown" if not available
-        """
+        """Get video duration in MM:SS format."""
         if not self._last_video_info:
             return "Unknown"
 
@@ -270,15 +281,10 @@ class YouTubeProcessor(ContentProcessor):
         if not duration_seconds:
             return "Unknown"
 
-        # Convert seconds to MM:SS format
         minutes = int(duration_seconds // 60)
         seconds = int(duration_seconds % 60)
         return f"{minutes}:{seconds:02d}"
 
     def get_prompt_template_name(self) -> str:
-        """Return name of prompt template to use.
-
-        Returns:
-            'youtube'
-        """
+        """Return name of prompt template to use."""
         return "youtube"
